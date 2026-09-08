@@ -497,7 +497,9 @@ fileInput.addEventListener("change", async (e) => {
   const arrayBuffer = await file.arrayBuffer();
 
   try {
-    pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    // PDF.jsに渡すとデータが内部的に転送され使えなくなる（detachされる）ことがあるため、
+    // 保存用に別途コピーを取っておいてから渡す
+    pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
     pdfArrayBuffer = arrayBuffer;
     pdfFileName = file.name;
     currentPage = 1;
@@ -1331,7 +1333,9 @@ async function loadFromIndexedDB() {
 
 // 保存データから地図・ピン・マス目の状態を復元する共通処理
 async function restoreProjectState(data) {
-  pdfDoc = await pdfjsLib.getDocument({ data: data.pdfData }).promise;
+  // PDF.jsに渡すとデータが内部的に転送され使えなくなる（detachされる）ことがあるため、
+  // 保存用に元データを残したまま、コピーの方をPDF.jsに渡す
+  pdfDoc = await pdfjsLib.getDocument({ data: data.pdfData.slice(0) }).promise;
   pdfArrayBuffer = data.pdfData;
   pdfFileName = data.pdfFileName || "";
   pins = data.pins || [];
