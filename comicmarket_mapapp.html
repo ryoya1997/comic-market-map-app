@@ -1,0 +1,1423 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>PDF読み込み・ピン配置 検証ツール</title>
+<style>
+  body {
+    font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+    background: #f2f2f2;
+    margin: 0;
+    padding: 20px;
+    color: #222;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+
+  /* 2カラムレイアウト：左が地図、右が画像リスト */
+  #layoutRow {
+    display: flex;
+    gap: 20px;
+    align-items: flex-start;
+  }
+  #mainColumn {
+    flex: 1;
+    min-width: 0; /* 中の要素が幅を突き破らないように */
+  }
+  #sideColumn {
+    width: 340px;
+    flex-shrink: 0;
+    position: sticky;
+    top: 20px;
+  }
+
+  /* スマホなど画面が狭い場合は1カラムに切り替える */
+  @media (max-width: 900px) {
+    body { padding: 10px; }
+    #layoutRow { flex-direction: column; }
+    #sideColumn {
+      width: 100%;
+      position: static;
+    }
+    #imageListPanel { max-height: 60vh; }
+    #toolbar { gap: 6px; }
+    #toolbar button, #toolbar input[type=file] { font-size: 13px; padding: 6px 8px; }
+    #viewerWrap { max-height: 65vh; }
+  }
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    background: #fff;
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin-bottom: 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  }
+  #toolbar button {
+    padding: 6px 12px;
+    border: 1px solid #ccc;
+    background: #fafafa;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  #toolbar button:hover { background: #eee; }
+  #toolbar button:disabled { opacity: 0.4; cursor: default; }
+  #toolbar button.primary { background: #2a6df4; color: #fff; border-color: #2a6df4; }
+  #toolbar button.primary:hover { background: #1d5adb; }
+  #pageInfo, #zoomInfo { font-size: 14px; min-width: 90px; text-align: center; }
+  #viewerWrap {
+    position: relative;
+    background: #ddd;
+    padding: 16px;
+    border-radius: 6px;
+    overflow: auto;
+    max-height: 80vh;
+  }
+  #stage {
+    position: relative;
+    display: inline-block;
+    line-height: 0; /* canvas下の余白を消す */
+  }
+  #pdfCanvas {
+    display: block;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    background: #fff;
+    /* 通常時はスマホでの地図スクロールを妨げないよう、マス目検出モード中だけJSでtouch-actionを切り替える */
+  }
+  /* ピンを重ねるレイヤー。canvasとぴったり同じ大きさになる */
+  #pinLayer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none; /* ピン以外の場所はクリックがcanvasまで届くようにする */
+  }
+  .pin {
+    position: absolute;
+    width: 44px; height: 44px;
+    transform: translate(-50%, -50%);
+    cursor: grab;
+    pointer-events: auto;
+    touch-action: none; /* 指でのドラッグ移動がブラウザのスクロールと衝突しないように */
+  }
+  /* 画像を丸角で切り抜くための内側の箱。ボタン類はこの外側(.pin)に置くのでハミ出しても隠れない */
+  .pinBody {
+    width: 100%; height: 100%;
+    border: 2px solid #e63946;
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 1px 5px rgba(0,0,0,0.45);
+    background: #fff;
+  }
+  .pin.dragging { cursor: grabbing; opacity: 0.85; z-index: 10; }
+  .pin.resizing { opacity: 0.85; z-index: 10; }
+  .pin.selected { box-shadow: 0 0 0 3px rgba(42,109,244,0.5); z-index: 5; }
+
+  /* 「地図で見る」で移動した直後に、画像を点滅させて分かりやすくする */
+  @keyframes pinFlash {
+    0%, 100% { box-shadow: 0 0 0 4px rgba(231,111,81,0.95); }
+    50% { box-shadow: 0 0 0 12px rgba(231,111,81,0); }
+  }
+  .pin.flash { animation: pinFlash 0.9s ease-in-out 4; z-index: 8; }
+
+  /* 対応する引き出し線・先端の点も同様に点滅させる */
+  @keyframes lineFlash {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.15; }
+  }
+  .flashLine { animation: lineFlash 0.9s ease-in-out 4; }
+
+  /* 選択時だけ下に出てくる操作ツールバー */
+  .pinToolbar {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin-top: 8px;
+    background: #fff;
+    border-radius: 20px;
+    padding: 4px 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .pin.selected .pinToolbar { display: flex; }
+
+  .pinToolbar button, .pinToolbar .delBtn, .pinToolbar .lineBtn {
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    border: none;
+    font-size: 15px;
+    line-height: 30px;
+    text-align: center;
+    cursor: pointer;
+    color: #fff;
+    padding: 0;
+  }
+  .delBtn { background: #e63946; }
+  .lineBtn { background: #2a9d8f; }
+  .lineBtn.active { background: #e76f51; }
+  .colorPicker {
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    border: 2px solid #ccc;
+    padding: 0;
+    cursor: pointer;
+    background: none;
+  }
+
+  /* サイズ変更ハンドルは選択時だけ表示、角に大きめに配置 */
+  .pin .resizeHandle {
+    display: none;
+    position: absolute;
+    right: -12px; bottom: -12px;
+    width: 32px; height: 32px;
+    background: #2a6df4;
+    border: 3px solid #fff;
+    border-radius: 50%;
+    cursor: nwse-resize;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.45);
+    touch-action: none; /* 指でのリサイズ操作がブラウザのスクロールと衝突しないように */
+  }
+  .pin.selected .resizeHandle { display: block; }
+  .pin img {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    display: block;
+    pointer-events: none; /* ドラッグ時に画像自体が邪魔しないように */
+  }
+  /* マス目（自動検出したセル）のレイヤー */
+  #cellLayer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
+  .cell {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1px solid rgba(42,109,244,0.55);
+    pointer-events: auto;
+    cursor: pointer;
+    background: rgba(42,109,244,0.03);
+  }
+  .cell:hover { background: rgba(42,109,244,0.18); }
+  .cell.selected {
+    background: rgba(255,183,3,0.45);
+    border: 1px solid #e08e00;
+  }
+  /* ドラッグで範囲選択している最中の枠 */
+  #regionBox {
+    position: absolute;
+    border: 2px dashed #2a6df4;
+    background: rgba(42,109,244,0.12);
+    pointer-events: none;
+    display: none;
+  }
+  #gridControls {
+    display: none;
+    background: #fff;
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    font-size: 13px;
+  }
+  #gridControls.active { display: block; }
+  #gridControls .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
+  #gridControls label { min-width: 170px; }
+  #gridControls input[type=range] { width: 160px; }
+  #gridControls button {
+    padding: 5px 10px; border: 1px solid #ccc; background: #fafafa;
+    border-radius: 4px; cursor: pointer; font-size: 13px;
+  }
+  /* 引き出し線を描画するレイヤー */
+  #lineLayer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
+  #status { font-size: 13px; color: #555; margin-top: 8px; }
+  #placingBanner {
+    display: none;
+    background: #fff7e0;
+    border: 1px solid #e9c46a;
+    color: #7a5c00;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  #pinCount { font-size: 13px; color: #333; margin-top: 8px; }
+
+  #imageListPanel {
+    background: #fff;
+    padding: 14px 16px;
+    border-radius: 6px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+  }
+  #imageListPanel h2 { font-size: 15px; margin: 0 0 10px; flex-shrink: 0; }
+  #imageListEmpty { font-size: 13px; color: #888; }
+  #imageListBody { overflow-y: auto; }
+  .listRow {
+    padding: 10px 4px;
+    border-bottom: 1px solid #eee;
+  }
+  .listRow.activeRow { background: #eef3ff; }
+  .listRowTop {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .listThumb {
+    width: 38px; height: 38px;
+    object-fit: contain;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fafafa;
+    flex-shrink: 0;
+  }
+  .listPage {
+    font-size: 12px;
+    color: #666;
+    min-width: 28px;
+    flex-shrink: 0;
+  }
+  .listInputWrap {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .listLabelInput {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  .listJumpBtn, .listDelBtn {
+    padding: 6px 10px;
+    border: 1px solid #ccc;
+    background: #fafafa;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .listDelBtn { margin-left: 0; color: #e63946; border-color: #e6a4a9; }
+  .listJumpBtn:hover { background: #eee; }
+  .listDelBtn:hover { background: #fdeceb; }
+  .memoWrap { display: flex; flex-direction: column; gap: 4px; }
+  .memoLink {
+    display: none;
+    font-size: 12px;
+    color: #2a6df4;
+    text-decoration: none;
+  }
+  .memoLink:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>PDF読み込み・画像ピン配置 検証ツール（フェーズ2〜3）</h1>
+
+<div id="layoutRow">
+<div id="mainColumn">
+
+<div id="toolbar">
+  <input type="file" id="fileInput" accept="application/pdf">
+  <button id="prevPage" disabled>◀ 前のページ</button>
+  <span id="pageInfo">- / -</span>
+  <button id="nextPage" disabled>次のページ ▶</button>
+  <button id="zoomOut" disabled>－</button>
+  <span id="zoomInfo">100%</span>
+  <button id="zoomIn" disabled>＋</button>
+  <button id="addImageBtn" class="primary" disabled>＋ 画像を追加</button>
+  <input type="file" id="imageFileInput" accept="image/*" style="display:none">
+  <button id="gridModeBtn" disabled>🔲 マス目自動検出</button>
+  <button id="saveFileBtn" disabled>💾 ファイルに保存</button>
+  <button id="loadFileBtn">📂 ファイルから読み込む</button>
+  <input type="file" id="loadFileInput" accept=".json" style="display:none">
+</div>
+
+<div id="placingBanner">画像を選びました。地図上の配置したい場所をクリックしてください。（キャンセルする場合はEscキー）</div>
+
+<div id="gridControls">
+  <b>マス目検出モード：</b> 地図上でブロック1つ分くらいの範囲をドラッグして囲むと、その中を自動でマス目に分割します。
+  イラストや文字ラベル部分は避けて、罫線がきれいに並んでいる部分を囲むと精度が上がります。
+  <div class="row">
+    <label>線とみなす濃さのしきい値：<span id="darkVal">140</span></label>
+    <input type="range" id="darkThreshold" min="80" max="200" value="140">
+  </div>
+  <div class="row">
+    <label>線とみなす割合（感度）：<span id="lineVal">0.50</span></label>
+    <input type="range" id="lineThreshold" min="0.2" max="0.8" step="0.05" value="0.5">
+  </div>
+  <div class="row">
+    <label>マスの最小サイズ(px)：<span id="minSizeVal">8</span></label>
+    <input type="range" id="minCellSize" min="4" max="40" value="8">
+    <label>最大サイズ(px)：<span id="maxSizeVal">60</span></label>
+    <input type="range" id="maxCellSize" min="20" max="150" value="60">
+  </div>
+  <div class="row">
+    <button id="redoDetectBtn" disabled>同じ範囲でもう一度検出</button>
+    <button id="clearCellsBtn">このページのマスを全て削除</button>
+    <button id="exitGridModeBtn">検出モードを終了</button>
+  </div>
+</div>
+
+<div id="viewerWrap">
+  <div id="stage">
+    <canvas id="pdfCanvas"></canvas>
+    <svg id="lineLayer"></svg>
+    <div id="pinLayer"></div>
+    <div id="cellLayer"></div>
+    <div id="regionBox"></div>
+  </div>
+</div>
+
+<div id="status">PDFファイルを選択してください。</div>
+<div id="pinCount"></div>
+
+</div>
+<div id="sideColumn">
+
+<div id="imageListPanel">
+  <h2>画像リスト</h2>
+  <div id="imageListEmpty">まだ画像が配置されていません。</div>
+  <div id="imageListBody"></div>
+</div>
+
+</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+// pdf.js本体の読み込みに失敗していないかを最初に確認する
+if (typeof pdfjsLib === "undefined") {
+  document.getElementById("status").textContent =
+    "エラー：pdf.js本体の読み込みに失敗しました。ブラウザの開発者ツール(F12)のConsoleタブに赤いエラーが出ていないか確認してください。";
+  throw new Error("pdfjsLib is not loaded");
+}
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const fileInput = document.getElementById("fileInput");
+const canvas = document.getElementById("pdfCanvas");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+const stage = document.getElementById("stage");
+const pinLayer = document.getElementById("pinLayer");
+const prevBtn = document.getElementById("prevPage");
+const nextBtn = document.getElementById("nextPage");
+const pageInfo = document.getElementById("pageInfo");
+const zoomOutBtn = document.getElementById("zoomOut");
+const zoomInBtn = document.getElementById("zoomIn");
+const zoomInfo = document.getElementById("zoomInfo");
+const statusEl = document.getElementById("status");
+const pinCountEl = document.getElementById("pinCount");
+const imageListBody = document.getElementById("imageListBody");
+const imageListEmpty = document.getElementById("imageListEmpty");
+const addImageBtn = document.getElementById("addImageBtn");
+const imageFileInput = document.getElementById("imageFileInput");
+const placingBanner = document.getElementById("placingBanner");
+const lineLayer = document.getElementById("lineLayer");
+let linePlacingPinId = null; // 「線の指し示し先」をクリック待ちしているピンのid
+let selectedPinId = null;    // 現在選択中（ツールバー表示中）のピンのid
+
+let pdfDoc = null;
+let currentPage = 1;
+let currentScale = 1.5;
+let pdfArrayBuffer = null; // 保存・復元のために元のPDFバイナリを保持しておく
+let pdfFileName = "";
+
+// ピンのデータ本体。将来「保存・読み込み」機能を作るときは、この配列を
+// そのままJSONにして書き出す/読み込む形にすれば良い。
+// 1件ごとに { id, page, xPercent, yPercent, imageData, circleName, spaceNo, memo } を持つ
+let pins = [];
+let pinIdCounter = 1;
+
+let placingImageData = null; // 配置待ちの画像（Data URL）
+let placingImageAspect = 1;  // 配置待ち画像の縦横比（幅÷高さ）
+let isPlacing = false;       // 「クリックして配置」待ち状態かどうか
+
+// 画像のData URLから、実際の縦横比(幅÷高さ)を読み取る
+function loadImageAspect(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      resolve(img.naturalWidth / img.naturalHeight || 1);
+    };
+    img.onerror = () => resolve(1); // 読み取れなかった場合は正方形扱いにする
+    img.src = dataUrl;
+  });
+}
+
+// ---------- マス目（自動検出セル）関連 ----------
+const gridModeBtn = document.getElementById("gridModeBtn");
+const saveFileBtn = document.getElementById("saveFileBtn");
+const loadFileBtn = document.getElementById("loadFileBtn");
+const loadFileInput = document.getElementById("loadFileInput");
+const gridControls = document.getElementById("gridControls");
+const cellLayer = document.getElementById("cellLayer");
+const regionBox = document.getElementById("regionBox");
+const redoDetectBtn = document.getElementById("redoDetectBtn");
+const clearCellsBtn = document.getElementById("clearCellsBtn");
+const exitGridModeBtn = document.getElementById("exitGridModeBtn");
+const darkThresholdInput = document.getElementById("darkThreshold");
+const lineThresholdInput = document.getElementById("lineThreshold");
+const minCellSizeInput = document.getElementById("minCellSize");
+const maxCellSizeInput = document.getElementById("maxCellSize");
+
+// 検出したマスは { id, page, xPercent, yPercent, wPercent, hPercent, selected } の配列
+let cells = [];
+let cellIdCounter = 1;
+
+let gridMode = false;      // マス目検出モード中かどうか
+let isDragging = false;    // 範囲をドラッグ中かどうか
+let dragStart = null;      // ドラッグ開始位置（canvasピクセル座標）
+let lastRegionPx = null;   // 最後に検出した範囲（canvasピクセル座標）。「もう一度検出」用
+
+// ---------- PDF読み込み ----------
+fileInput.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  statusEl.textContent = "読み込み中...";
+  const arrayBuffer = await file.arrayBuffer();
+
+  try {
+    pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    pdfArrayBuffer = arrayBuffer;
+    pdfFileName = file.name;
+    currentPage = 1;
+    pins = []; // 新しいPDFを読み込んだらピンはリセット
+    cells = []; // マス目もリセット
+    prevBtn.disabled = false;
+    nextBtn.disabled = false;
+    zoomInBtn.disabled = false;
+    zoomOutBtn.disabled = false;
+    addImageBtn.disabled = false;
+    gridModeBtn.disabled = false;
+    saveFileBtn.disabled = false;
+    await renderPage(currentPage);
+    statusEl.textContent = `読み込み成功：全 ${pdfDoc.numPages} ページ`;
+  } catch (err) {
+    statusEl.textContent = "読み込み失敗：" + err.message;
+    console.error(err);
+  }
+});
+
+async function renderPage(pageNum) {
+  const page = await pdfDoc.getPage(pageNum);
+  const viewport = page.getViewport({ scale: currentScale });
+
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+
+  await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+  pageInfo.textContent = `${pageNum} / ${pdfDoc.numPages}`;
+  zoomInfo.textContent = Math.round(currentScale / 1.5 * 100) + "%";
+
+  prevBtn.disabled = pageNum <= 1;
+  nextBtn.disabled = pageNum >= pdfDoc.numPages;
+
+  renderPins(); // ページ・拡大率が変わるたびにピンを描き直す
+  renderCells(); // マス目も同様に描き直す
+  renderLines(); // 引き出し線も同様に描き直す
+}
+
+prevBtn.addEventListener("click", () => {
+  if (currentPage > 1) { currentPage--; renderPage(currentPage); }
+});
+nextBtn.addEventListener("click", () => {
+  if (currentPage < pdfDoc.numPages) { currentPage++; renderPage(currentPage); }
+});
+zoomInBtn.addEventListener("click", () => {
+  currentScale = Math.min(currentScale + 0.25, 4);
+  renderPage(currentPage);
+});
+zoomOutBtn.addEventListener("click", () => {
+  currentScale = Math.max(currentScale - 0.25, 0.5);
+  renderPage(currentPage);
+});
+
+// ---------- 画像を選んで「配置待ち」状態にする ----------
+addImageBtn.addEventListener("click", () => {
+  imageFileInput.click();
+});
+
+imageFileInput.addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = async () => {
+    placingImageData = reader.result; // 画像をData URL文字列として保持
+    placingImageAspect = await loadImageAspect(placingImageData); // 元画像の縦横比を取得
+    isPlacing = true;
+    placingBanner.style.display = "block";
+    placingBanner.textContent = "画像を選びました。地図上の配置したい場所をクリックしてください。（キャンセルする場合はEscキー）";
+    statusEl.textContent = "地図上をクリックして配置位置を指定してください。";
+  };
+  reader.readAsDataURL(file);
+
+  // 同じファイルを連続で選び直せるよう毎回リセット
+  imageFileInput.value = "";
+});
+
+// Escキーで配置待ちをキャンセル
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (isPlacing) cancelPlacing();
+    if (linePlacingPinId !== null) {
+      linePlacingPinId = null;
+      placingBanner.style.display = "none";
+      statusEl.textContent = "線の配置をキャンセルしました。";
+      renderPins();
+    }
+  }
+});
+
+function cancelPlacing() {
+  isPlacing = false;
+  placingImageData = null;
+  placingBanner.style.display = "none";
+  statusEl.textContent = "配置をキャンセルしました。";
+}
+
+// ---------- canvasクリックでピンを配置 ----------
+canvas.addEventListener("click", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const xPercent = ((e.clientX - rect.left) / rect.width) * 100;
+  const yPercent = ((e.clientY - rect.top) / rect.height) * 100;
+
+  // 線の指し示し先を待っている場合はそちらを優先する
+  if (linePlacingPinId !== null) {
+    const targetPin = pins.find(p => p.id === linePlacingPinId);
+    if (targetPin) {
+      targetPin.line = { xPercent, yPercent };
+    }
+    linePlacingPinId = null;
+    placingBanner.style.display = "none";
+    statusEl.textContent = "線を配置しました。";
+    renderPins();
+    renderLines();
+    return;
+  }
+
+  if (!isPlacing || !placingImageData) {
+    // 何もしていない状態で地図の何もない場所をクリックしたら、選択中のピンを解除する
+    if (selectedPinId !== null) {
+      selectedPinId = null;
+      renderPins();
+    }
+    return;
+  }
+
+  // 縦横比に合わせて初期サイズを決める（長い方の辺を44pxに揃える）
+  const baseSide = 140;
+  const aspect = placingImageAspect || 1;
+  const initW = aspect >= 1 ? baseSide : baseSide * aspect;
+  const initH = aspect >= 1 ? baseSide / aspect : baseSide;
+
+  const newPin = {
+    id: pinIdCounter++,
+    page: currentPage,
+    xPercent: xPercent,
+    yPercent: yPercent,
+    imageData: placingImageData,
+    circleName: "", // サークル名
+    spaceNo: "",    // 地図上のスペース番号
+    memo: "",       // メモ
+    aspect: aspect, // 幅÷高さ。サイズ変更時にこの比率を保つ
+    w: initW,       // 表示幅(px)
+    h: initH        // 表示高さ(px)
+  };
+  pins.push(newPin);
+  selectedPinId = newPin.id; // 配置直後はツールバーが見えるよう選択状態にする
+
+  isPlacing = false;
+  placingImageData = null;
+  placingBanner.style.display = "none";
+  statusEl.textContent = "ピンを配置しました。続けて「＋ 画像を追加」で他の画像も配置できます。";
+
+  renderPins();
+});
+
+// ---------- ピンの描画 ----------
+function renderPins() {
+  pinLayer.innerHTML = "";
+
+  const pagesPins = pins.filter(p => p.page === currentPage);
+  pagesPins.forEach(pin => {
+    const el = document.createElement("div");
+    el.className = "pin" + (pin.id === selectedPinId ? " selected" : "");
+    el.style.left = pin.xPercent + "%";
+    el.style.top = pin.yPercent + "%";
+    el.style.width = (pin.w || 44) + "px";
+    el.style.height = (pin.h || 44) + "px";
+    el.dataset.pinId = pin.id;
+
+    const body = document.createElement("div");
+    body.className = "pinBody";
+
+    const img = document.createElement("img");
+    img.src = pin.imageData;
+    body.appendChild(img);
+
+    el.appendChild(body);
+
+    const resizeHandle = document.createElement("div");
+    resizeHandle.className = "resizeHandle";
+    resizeHandle.title = "ドラッグしてサイズ変更";
+    resizeHandle.addEventListener("pointerdown", (ev) => startResize(ev, pin, el));
+    el.appendChild(resizeHandle);
+
+    // 選択時のみ表示される操作ツールバー（画像の下・中央寄せ）
+    const toolbar = document.createElement("div");
+    toolbar.className = "pinToolbar";
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "delBtn";
+    delBtn.textContent = "×";
+    delBtn.title = "この画像を削除";
+    delBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      pins = pins.filter(p => p.id !== pin.id);
+      if (selectedPinId === pin.id) selectedPinId = null;
+      renderPins();
+      renderLines();
+    });
+    toolbar.appendChild(delBtn);
+
+    const lineBtn = document.createElement("button");
+    lineBtn.className = "lineBtn" + (linePlacingPinId === pin.id ? " active" : "");
+    lineBtn.textContent = "線";
+    lineBtn.title = pin.line ? "線を削除" : "地図上の場所へ線を引く";
+    lineBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (pin.line) {
+        // すでに線がある場合はクリックで削除する
+        pin.line = null;
+        renderPins();
+        renderLines();
+      } else {
+        // 線がない場合はクリック待ち状態にする
+        if (isPlacing) cancelPlacing();
+        linePlacingPinId = pin.id;
+        placingBanner.style.display = "block";
+        placingBanner.textContent = "地図上の指し示したい場所をクリックしてください。（キャンセルはEscキー）";
+        renderPins();
+      }
+    });
+    toolbar.appendChild(lineBtn);
+
+    const colorPicker = document.createElement("input");
+    colorPicker.type = "color";
+    colorPicker.className = "colorPicker";
+    colorPicker.title = "線の色を選ぶ";
+    colorPicker.value = pin.lineColor || "#ff0000";
+    colorPicker.addEventListener("click", (ev) => ev.stopPropagation());
+    colorPicker.addEventListener("input", (ev) => {
+      pin.lineColor = ev.target.value;
+      renderLines(); // 色を選んだ瞬間にプレビューが反映されるように
+      scheduleAutoSave();
+    });
+    toolbar.appendChild(colorPicker);
+
+    el.appendChild(toolbar);
+
+    // ドラッグで位置を動かせるようにする（ボタン・ハンドル・ツールバー上では発動させない）
+    el.addEventListener("pointerdown", (ev) => {
+      if (ev.target.closest(".pinToolbar")) return;
+      if (ev.target.classList.contains("resizeHandle")) return;
+      startDrag(ev, pin, el);
+    });
+
+    pinLayer.appendChild(el);
+  });
+
+  pinCountEl.textContent = `このページのピン数：${pagesPins.length}（全ページ合計：${pins.length}）`;
+  renderList();
+  scheduleAutoSave();
+}
+
+// ---------- 画像リスト（サークル名などの紐づけ）----------
+function renderList() {
+  imageListBody.innerHTML = "";
+
+  if (pins.length === 0) {
+    imageListEmpty.style.display = "block";
+    return;
+  }
+  imageListEmpty.style.display = "none";
+
+  // ページ順・配置順に並べる
+  const sorted = [...pins].sort((a, b) => a.page - b.page || a.id - b.id);
+
+  sorted.forEach(pin => {
+    const row = document.createElement("div");
+    row.className = "listRow" + (pin.id === selectedPinId ? " activeRow" : "");
+
+    const top = document.createElement("div");
+    top.className = "listRowTop";
+
+    const thumb = document.createElement("img");
+    thumb.className = "listThumb";
+    thumb.src = pin.imageData;
+    top.appendChild(thumb);
+
+    const pageLabel = document.createElement("span");
+    pageLabel.className = "listPage";
+    pageLabel.textContent = `p.${pin.page}`;
+    top.appendChild(pageLabel);
+
+    const jumpBtn = document.createElement("button");
+    jumpBtn.className = "listJumpBtn";
+    jumpBtn.textContent = "地図で見る";
+    jumpBtn.addEventListener("click", async () => {
+      if (pin.page !== currentPage) {
+        currentPage = pin.page;
+        await renderPage(currentPage); // 内部でrenderPins→renderListも呼ばれる
+      }
+      selectedPinId = pin.id;
+      renderPins();
+      renderLines();
+      const target = pinLayer.querySelector(`[data-pin-id="${pin.id}"]`);
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+      flashPin(pin.id);
+    });
+    top.appendChild(jumpBtn);
+
+    const delBtn2 = document.createElement("button");
+    delBtn2.className = "listDelBtn";
+    delBtn2.textContent = "削除";
+    delBtn2.addEventListener("click", () => {
+      const name = pin.circleName ? `「${pin.circleName}」` : "この画像";
+      if (!confirm(`${name}を削除します。よろしいですか？`)) return;
+      pins = pins.filter(p => p.id !== pin.id);
+      if (selectedPinId === pin.id) selectedPinId = null;
+      renderPins();
+      renderLines();
+    });
+    top.appendChild(delBtn2);
+
+    row.appendChild(top);
+
+    const inputWrap = document.createElement("div");
+    inputWrap.className = "listInputWrap";
+
+    const circleNameInput = document.createElement("input");
+    circleNameInput.type = "text";
+    circleNameInput.className = "listLabelInput";
+    circleNameInput.placeholder = "サークル名";
+    circleNameInput.value = pin.circleName || "";
+    circleNameInput.addEventListener("input", (ev) => {
+      pin.circleName = ev.target.value;
+      scheduleAutoSave();
+    });
+    inputWrap.appendChild(circleNameInput);
+
+    const spaceNoInput = document.createElement("input");
+    spaceNoInput.type = "text";
+    spaceNoInput.className = "listLabelInput";
+    spaceNoInput.placeholder = "地図上の番号";
+    spaceNoInput.value = pin.spaceNo || "";
+    spaceNoInput.addEventListener("input", (ev) => {
+      pin.spaceNo = ev.target.value;
+      scheduleAutoSave();
+    });
+    inputWrap.appendChild(spaceNoInput);
+
+    const memoWrap = document.createElement("div");
+    memoWrap.className = "memoWrap";
+
+    const memoInput = document.createElement("input");
+    memoInput.type = "text";
+    memoInput.className = "listLabelInput";
+    memoInput.placeholder = "メモ（URLを入力するとリンクになります）";
+    memoInput.value = pin.memo || "";
+    memoWrap.appendChild(memoInput);
+
+    const memoLink = document.createElement("a");
+    memoLink.className = "memoLink";
+    memoLink.textContent = "🔗 リンクを開く";
+    memoLink.target = "_blank";
+    memoLink.rel = "noopener noreferrer";
+    memoWrap.appendChild(memoLink);
+
+    function updateMemoLink(value) {
+      const trimmed = (value || "").trim();
+      if (/^https?:\/\/\S+$/i.test(trimmed)) {
+        memoLink.href = trimmed;
+        memoLink.style.display = "inline-block";
+      } else {
+        memoLink.style.display = "none";
+      }
+    }
+    updateMemoLink(pin.memo);
+
+    memoInput.addEventListener("input", (ev) => {
+      pin.memo = ev.target.value;
+      updateMemoLink(pin.memo);
+      scheduleAutoSave();
+    });
+
+    inputWrap.appendChild(memoWrap);
+
+    row.appendChild(inputWrap);
+
+    imageListBody.appendChild(row);
+  });
+}
+
+// ---------- マス目検出モードの切り替え ----------
+gridModeBtn.addEventListener("click", () => {
+  gridMode = true;
+  gridControls.classList.add("active");
+  canvas.style.touchAction = "none"; // ドラッグで範囲選択する間は、スマホの画面スクロールを止める
+  statusEl.textContent = "マス目検出モード：地図上でブロック1つ分をドラッグして囲んでください。";
+  // 配置待ち状態と衝突しないようキャンセルしておく
+  if (isPlacing) cancelPlacing();
+});
+
+exitGridModeBtn.addEventListener("click", () => {
+  gridMode = false;
+  gridControls.classList.remove("active");
+  canvas.style.touchAction = ""; // 通常時はスマホでの地図スクロールを再び有効にする
+  regionBox.style.display = "none";
+  statusEl.textContent = "マス目検出モードを終了しました。";
+});
+
+clearCellsBtn.addEventListener("click", () => {
+  cells = cells.filter(c => c.page !== currentPage);
+  renderCells();
+});
+
+[darkThresholdInput, lineThresholdInput, minCellSizeInput, maxCellSizeInput].forEach(el => {
+  el.addEventListener("input", () => {
+    document.getElementById("darkVal").textContent = darkThresholdInput.value;
+    document.getElementById("lineVal").textContent = parseFloat(lineThresholdInput.value).toFixed(2);
+    document.getElementById("minSizeVal").textContent = minCellSizeInput.value;
+    document.getElementById("maxSizeVal").textContent = maxCellSizeInput.value;
+  });
+});
+
+redoDetectBtn.addEventListener("click", () => {
+  if (lastRegionPx) runDetection(lastRegionPx);
+});
+
+// ---------- ドラッグで範囲を選ぶ ----------
+canvas.addEventListener("pointerdown", (e) => {
+  if (!gridMode) return;
+  isDragging = true;
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  dragStart = {
+    x: (e.clientX - rect.left) * scaleX,
+    y: (e.clientY - rect.top) * scaleY
+  };
+  regionBox.style.display = "block";
+  updateRegionBoxVisual(dragStart, dragStart);
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  if (!gridMode || !isDragging) return;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const cur = {
+    x: (e.clientX - rect.left) * scaleX,
+    y: (e.clientY - rect.top) * scaleY
+  };
+  updateRegionBoxVisual(dragStart, cur);
+});
+
+canvas.addEventListener("pointerup", (e) => {
+  if (!gridMode || !isDragging) return;
+  isDragging = false;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const end = {
+    x: (e.clientX - rect.left) * scaleX,
+    y: (e.clientY - rect.top) * scaleY
+  };
+
+  const region = {
+    x: Math.min(dragStart.x, end.x),
+    y: Math.min(dragStart.y, end.y),
+    w: Math.abs(end.x - dragStart.x),
+    h: Math.abs(end.y - dragStart.y)
+  };
+
+  if (region.w < 15 || region.h < 15) {
+    statusEl.textContent = "範囲が小さすぎます。もう少し広めにドラッグしてください。";
+    regionBox.style.display = "none";
+    return;
+  }
+
+  lastRegionPx = region;
+  redoDetectBtn.disabled = false;
+  runDetection(region);
+});
+
+function updateRegionBoxVisual(start, cur) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleXInv = rect.width / canvas.width;
+  const scaleYInv = rect.height / canvas.height;
+  const x = Math.min(start.x, cur.x) * scaleXInv;
+  const y = Math.min(start.y, cur.y) * scaleYInv;
+  const w = Math.abs(cur.x - start.x) * scaleXInv;
+  const h = Math.abs(cur.y - start.y) * scaleYInv;
+  regionBox.style.left = x + "px";
+  regionBox.style.top = y + "px";
+  regionBox.style.width = w + "px";
+  regionBox.style.height = h + "px";
+}
+
+// ---------- 範囲内のピクセルを解析してマス目を検出する ----------
+function runDetection(region) {
+  regionBox.style.display = "none";
+
+  const rx = Math.round(region.x), ry = Math.round(region.y);
+  const rw = Math.round(region.w), rh = Math.round(region.h);
+
+  let imageData;
+  try {
+    imageData = ctx.getImageData(rx, ry, rw, rh);
+  } catch (err) {
+    statusEl.textContent = "検出に失敗しました：" + err.message;
+    return;
+  }
+
+  const darkThreshold = parseInt(darkThresholdInput.value, 10);
+  const lineThreshold = parseFloat(lineThresholdInput.value);
+  const minSize = parseInt(minCellSizeInput.value, 10);
+  const maxSize = parseInt(maxCellSizeInput.value, 10);
+
+  // グレースケール化して「暗いピクセルか」を判定するマスクを作る
+  const data = imageData.data;
+  const dark = new Uint8Array(rw * rh);
+  for (let i = 0; i < rw * rh; i++) {
+    const r = data[i*4], g = data[i*4+1], b = data[i*4+2];
+    const lum = (r + g + b) / 3;
+    dark[i] = lum < darkThreshold ? 1 : 0;
+  }
+
+  // 行ごと・列ごとに「暗いピクセルの割合」を計算する
+  const rowFrac = new Float32Array(rh);
+  for (let y = 0; y < rh; y++) {
+    let sum = 0;
+    for (let x = 0; x < rw; x++) sum += dark[y*rw + x];
+    rowFrac[y] = sum / rw;
+  }
+  const colFrac = new Float32Array(rw);
+  for (let x = 0; x < rw; x++) {
+    let sum = 0;
+    for (let y = 0; y < rh; y++) sum += dark[y*rw + x];
+    colFrac[x] = sum / rh;
+  }
+
+  // しきい値を超えた行/列を「線」とみなし、連続する行/列は1本の線にまとめる
+  function findLines(frac) {
+    const idxs = [];
+    for (let i = 0; i < frac.length; i++) {
+      if (frac[i] > lineThreshold) idxs.push(i);
+    }
+    const lines = [];
+    let start = null, prev = null;
+    for (const i of idxs) {
+      if (start === null) { start = i; prev = i; continue; }
+      if (i - prev > 2) { lines.push(Math.round((start+prev)/2)); start = i; }
+      prev = i;
+    }
+    if (start !== null) lines.push(Math.round((start+prev)/2));
+    return lines;
+  }
+
+  let rowLines = findLines(rowFrac);
+  let colLines = findLines(colFrac);
+
+  // 範囲の端も線として扱う（端で切れているマスも拾うため）
+  if (rowLines.length === 0 || rowLines[0] > 3) rowLines.unshift(0);
+  if (rowLines[rowLines.length-1] < rh - 3) rowLines.push(rh - 1);
+  if (colLines.length === 0 || colLines[0] > 3) colLines.unshift(0);
+  if (colLines[colLines.length-1] < rw - 3) colLines.push(rw - 1);
+
+  // 線と線の間を「マス」の候補として切り出す
+  const newCells = [];
+  for (let i = 0; i < rowLines.length - 1; i++) {
+    const cellH = rowLines[i+1] - rowLines[i];
+    if (cellH < minSize || cellH > maxSize) continue;
+    for (let j = 0; j < colLines.length - 1; j++) {
+      const cellW = colLines[j+1] - colLines[j];
+      if (cellW < minSize || cellW > maxSize) continue;
+
+      const absX = rx + colLines[j];
+      const absY = ry + rowLines[i];
+
+      newCells.push({
+        id: cellIdCounter++,
+        page: currentPage,
+        xPercent: (absX / canvas.width) * 100,
+        yPercent: (absY / canvas.height) * 100,
+        wPercent: (cellW / canvas.width) * 100,
+        hPercent: (cellH / canvas.height) * 100,
+        selected: false
+      });
+    }
+  }
+
+  if (newCells.length === 0) {
+    statusEl.textContent = "マスを検出できませんでした。感度スライダーを調整して「同じ範囲でもう一度検出」を試してください。";
+    return;
+  }
+
+  cells = cells.concat(newCells);
+  renderCells();
+  statusEl.textContent = `${newCells.length}個のマスを検出しました（このページ合計：${cells.filter(c=>c.page===currentPage).length}個）。精度が悪ければ感度を調整して再検出できます。`;
+}
+
+// ---------- マス目の描画 ----------
+function renderCells() {
+  cellLayer.innerHTML = "";
+  const pageCells = cells.filter(c => c.page === currentPage);
+  pageCells.forEach(cell => {
+    const el = document.createElement("div");
+    el.className = "cell" + (cell.selected ? " selected" : "");
+    el.style.left = cell.xPercent + "%";
+    el.style.top = cell.yPercent + "%";
+    el.style.width = cell.wPercent + "%";
+    el.style.height = cell.hPercent + "%";
+    el.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      cell.selected = !cell.selected;
+      el.classList.toggle("selected", cell.selected);
+      scheduleAutoSave();
+    });
+    cellLayer.appendChild(el);
+  });
+  scheduleAutoSave();
+}
+
+// ---------- ピンのサイズ変更 ----------
+function startResize(e, pin, el) {
+  e.preventDefault();
+  e.stopPropagation(); // 親(ピン本体)のドラッグ移動が発動しないようにする
+  try { e.target.setPointerCapture(e.pointerId); } catch (err) {} // 指がズレても操作が途切れないようにする
+
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const startW = pin.w || 44;
+  const aspect = pin.aspect || 1;
+  el.classList.add("resizing");
+
+  function onMove(ev) {
+    // 右下方向へのドラッグ量の平均を使って、直感的に拡大縮小できるようにする
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    const delta = (dx + dy) / 2;
+    let newW = startW + delta;
+    newW = Math.max(15, Math.min(280, newW)); // 小さすぎ・大きすぎを防ぐ
+    const newH = newW / aspect; // 縦横比を保ったまま高さを決める
+
+    el.style.width = newW + "px";
+    el.style.height = newH + "px";
+    pin._tempW = newW;
+    pin._tempH = newH;
+  }
+
+  function onUp() {
+    el.classList.remove("resizing");
+    if (pin._tempW !== undefined) {
+      pin.w = pin._tempW;
+      pin.h = pin._tempH;
+      delete pin._tempW;
+      delete pin._tempH;
+    }
+    document.removeEventListener("pointermove", onMove);
+    document.removeEventListener("pointerup", onUp);
+  }
+
+  document.addEventListener("pointermove", onMove);
+  document.addEventListener("pointerup", onUp);
+}
+
+// ---------- 引き出し線の描画 ----------
+function renderLines() {
+  // SVGの座標系をcanvasの実ピクセルサイズに合わせる（歪み防止）
+  lineLayer.setAttribute("viewBox", `0 0 ${canvas.width} ${canvas.height}`);
+  lineLayer.setAttribute("preserveAspectRatio", "none");
+  lineLayer.innerHTML = "";
+
+  const pageCells = pins.filter(p => p.page === currentPage && p.line);
+  pageCells.forEach(pin => {
+    const x1 = (pin.xPercent / 100) * canvas.width;
+    const y1 = (pin.yPercent / 100) * canvas.height;
+    const x2 = (pin.line.xPercent / 100) * canvas.width;
+    const y2 = (pin.line.yPercent / 100) * canvas.height;
+
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", x1);
+    line.setAttribute("y1", y1);
+    line.setAttribute("x2", x2);
+    line.setAttribute("y2", y2);
+    line.setAttribute("stroke", pin.lineColor || "#ff0000");
+    line.setAttribute("stroke-width", "3");
+    line.setAttribute("data-pin-id", pin.id);
+    lineLayer.appendChild(line);
+
+    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    dot.setAttribute("cx", x2);
+    dot.setAttribute("cy", y2);
+    dot.setAttribute("r", "4");
+    dot.setAttribute("fill", pin.lineColor || "#ff0000");
+    dot.setAttribute("data-pin-id", pin.id);
+    lineLayer.appendChild(dot);
+  });
+}
+
+// ---------- 「地図で見る」で移動した画像・線を点滅させる ----------
+function flashPin(pinId) {
+  const pinEl = pinLayer.querySelector(`[data-pin-id="${pinId}"]`);
+  if (pinEl) {
+    pinEl.classList.remove("flash");
+    void pinEl.offsetWidth; // 再生中でも点滅をやり直せるよう、一度強制的に描画をリセットする
+    pinEl.classList.add("flash");
+  }
+  lineLayer.querySelectorAll(`[data-pin-id="${pinId}"]`).forEach(el => {
+    el.classList.remove("flashLine");
+    void el.getBoundingClientRect(); // 再生中でも点滅をやり直せるよう、強制的にリフローさせる
+    el.classList.add("flashLine");
+  });
+}
+
+// ---------- ピンのドラッグ移動 ----------
+function startDrag(e, pin, el) {
+  e.preventDefault();
+  try { e.target.setPointerCapture(e.pointerId); } catch (err) {} // 指がズレても操作が途切れないようにする
+  el.classList.add("dragging");
+
+  function onMove(ev) {
+    const rect = canvas.getBoundingClientRect();
+    let xPercent = ((ev.clientX - rect.left) / rect.width) * 100;
+    let yPercent = ((ev.clientY - rect.top) / rect.height) * 100;
+    // 0〜100%の範囲に収める
+    xPercent = Math.max(0, Math.min(100, xPercent));
+    yPercent = Math.max(0, Math.min(100, yPercent));
+    el.style.left = xPercent + "%";
+    el.style.top = yPercent + "%";
+    pin._tempX = xPercent;
+    pin._tempY = yPercent;
+    if (pin.line) {
+      // ドラッグ中も引き出し線の起点をリアルタイムで追従させる
+      const originalX = pin.xPercent, originalY = pin.yPercent;
+      pin.xPercent = xPercent;
+      pin.yPercent = yPercent;
+      renderLines();
+      pin.xPercent = originalX;
+      pin.yPercent = originalY;
+    }
+  }
+
+  function onUp() {
+    el.classList.remove("dragging");
+    if (pin._tempX !== undefined) {
+      pin.xPercent = pin._tempX;
+      pin.yPercent = pin._tempY;
+      delete pin._tempX;
+      delete pin._tempY;
+    }
+    // クリック・ドラッグどちらの場合も、操作したピンを選択状態にしてツールバーを表示する
+    selectedPinId = pin.id;
+    renderPins();
+    renderLines();
+    document.removeEventListener("pointermove", onMove);
+    document.removeEventListener("pointerup", onUp);
+  }
+
+  document.addEventListener("pointermove", onMove);
+  document.addEventListener("pointerup", onUp);
+}
+
+// ---------- 保存・読み込み機能 ----------
+
+// 大きなデータをbase64に変換する（ファイル書き出し用）
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+function base64ToArrayBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// --- 自動保存（ブラウザ内・IndexedDB）---
+const DB_NAME = "comiketMapToolDB";
+const STORE_NAME = "project";
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(STORE_NAME);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+let saveTimer = null;
+function scheduleAutoSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveToIndexedDB, 800); // 短い間隔での連続保存を防ぐ
+}
+
+async function saveToIndexedDB() {
+  if (!pdfArrayBuffer) return; // PDFが読み込まれる前は保存しない
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put({
+      pdfData: pdfArrayBuffer,
+      pdfFileName: pdfFileName,
+      pins, cells, currentPage, currentScale,
+      savedAt: Date.now()
+    }, "current");
+    await new Promise((res, rej) => {
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+    });
+  } catch (err) {
+    console.error("自動保存に失敗しました:", err);
+  }
+}
+
+async function loadFromIndexedDB() {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const req = tx.objectStore(STORE_NAME).get("current");
+    return await new Promise((res, rej) => {
+      req.onsuccess = () => res(req.result || null);
+      req.onerror = () => rej(req.error);
+    });
+  } catch (err) {
+    return null;
+  }
+}
+
+// 保存データから地図・ピン・マス目の状態を復元する共通処理
+async function restoreProjectState(data) {
+  pdfDoc = await pdfjsLib.getDocument({ data: data.pdfData }).promise;
+  pdfArrayBuffer = data.pdfData;
+  pdfFileName = data.pdfFileName || "";
+  pins = data.pins || [];
+  cells = data.cells || [];
+  currentPage = Math.min(data.currentPage || 1, pdfDoc.numPages);
+  currentScale = data.currentScale || 1.5;
+
+  prevBtn.disabled = false;
+  nextBtn.disabled = false;
+  zoomInBtn.disabled = false;
+  zoomOutBtn.disabled = false;
+  addImageBtn.disabled = false;
+  gridModeBtn.disabled = false;
+  saveFileBtn.disabled = false;
+
+  await renderPage(currentPage);
+  statusEl.textContent = `復元しました：全 ${pdfDoc.numPages} ページ／画像 ${pins.length} 件`;
+}
+
+// ページ起動時に、自動保存されたデータがないか確認する
+(async function checkAutoSavedData() {
+  const saved = await loadFromIndexedDB();
+  if (!saved || !saved.pdfData) return;
+  const savedDate = new Date(saved.savedAt).toLocaleString("ja-JP");
+  const ok = confirm(
+    `前回保存されたデータがあります（${savedDate} ／ 画像 ${(saved.pins || []).length} 件）。\n続きから再開しますか？`
+  );
+  if (ok) {
+    try {
+      await restoreProjectState(saved);
+    } catch (err) {
+      alert("復元に失敗しました：" + err.message);
+    }
+  }
+})();
+
+// --- ファイルへの書き出し ---
+saveFileBtn.addEventListener("click", () => {
+  if (!pdfArrayBuffer) return;
+  const data = {
+    format: "comiket-map-tool-v1",
+    pdfFileName: pdfFileName,
+    pdfBase64: arrayBufferToBase64(pdfArrayBuffer),
+    pins, cells, currentPage, currentScale,
+    savedAt: Date.now()
+  };
+  const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const dateStr = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `comiket-map-${dateStr}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// --- ファイルからの読み込み ---
+loadFileBtn.addEventListener("click", () => loadFileInput.click());
+
+loadFileInput.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  loadFileInput.value = "";
+
+  statusEl.textContent = "読み込み中...";
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if (!data.pdfBase64) throw new Error("このファイルには地図データが含まれていません。");
+
+    const buffer = base64ToArrayBuffer(data.pdfBase64);
+    await restoreProjectState({
+      pdfData: buffer,
+      pdfFileName: data.pdfFileName,
+      pins: data.pins,
+      cells: data.cells,
+      currentPage: data.currentPage,
+      currentScale: data.currentScale
+    });
+    scheduleAutoSave(); // 読み込んだ内容を自動保存にも反映しておく
+  } catch (err) {
+    statusEl.textContent = "読み込み失敗：" + err.message;
+    alert("ファイルの読み込みに失敗しました：" + err.message);
+  }
+});
+</script>
+
+</body>
+</html>
