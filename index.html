@@ -1370,22 +1370,38 @@ async function restoreProjectState(data) {
 
 // --- ファイルへの書き出し ---
 saveFileBtn.addEventListener("click", () => {
-  if (!pdfArrayBuffer) return;
-  const data = {
-    format: "comiket-map-tool-v1",
-    pdfFileName: pdfFileName,
-    pdfBase64: arrayBufferToBase64(pdfArrayBuffer),
-    pins, cells, currentPage, currentScale,
-    savedAt: Date.now()
-  };
-  const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  const dateStr = new Date().toISOString().slice(0, 10);
-  a.href = url;
-  a.download = `comiket-map-${dateStr}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+  if (!pdfArrayBuffer) {
+    alert("先にPDFを読み込んでから保存してください。");
+    return;
+  }
+  try {
+    const data = {
+      format: "comiket-map-tool-v1",
+      pdfFileName: pdfFileName,
+      pdfBase64: arrayBufferToBase64(pdfArrayBuffer),
+      pins, cells, currentPage, currentScale,
+      savedAt: Date.now()
+    };
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const dateStr = new Date().toISOString().slice(0, 10);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `comiket-map-${dateStr}.json`;
+    a.style.display = "none";
+    document.body.appendChild(a); // 一部のブラウザはDOMに存在しないとダウンロードが始まらないため
+    a.click();
+    document.body.removeChild(a);
+
+    // クリック直後に取り消すとダウンロードが始まる前にURLが無効化されることがあるため、少し待ってから解放する
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    statusEl.textContent = "ファイルに保存しました（ダウンロードフォルダをご確認ください）。";
+  } catch (err) {
+    console.error(err);
+    alert("保存に失敗しました：" + err.message);
+  }
 });
 
 // --- ファイルからの読み込み ---
