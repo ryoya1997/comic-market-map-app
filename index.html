@@ -218,6 +218,47 @@
     pointer-events: none;
     display: none;
   }
+  #saveManagerPanel {
+    display: none;
+    background: #fff;
+    padding: 14px 16px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    font-size: 13px;
+  }
+  #saveManagerPanel.active { display: block; }
+  #saveManagerPanel .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+  #saveManagerPanel input[type=text] {
+    flex: 1;
+    min-width: 160px;
+    padding: 7px 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  #saveManagerPanel button {
+    padding: 7px 12px;
+    border: 1px solid #ccc;
+    background: #fafafa;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  #savedListEmpty { color: #888; margin: 8px 0; }
+  .savedRow {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 4px;
+    border-bottom: 1px solid #eee;
+  }
+  .savedRow .savedInfo { flex: 1; min-width: 0; }
+  .savedRow .savedName { font-weight: bold; }
+  .savedRow .savedMeta { font-size: 12px; color: #777; }
+  .savedRow button { flex-shrink: 0; }
+  .savedRow .savedDelBtn { color: #e63946; border-color: #e6a4a9; }
+
   #gridControls {
     display: none;
     background: #fff;
@@ -346,12 +387,27 @@
   <button id="addImageBtn" class="primary" disabled>＋ 画像を追加</button>
   <input type="file" id="imageFileInput" accept="image/*" style="display:none">
   <button id="gridModeBtn" disabled>🔲 マス目自動検出</button>
-  <button id="saveFileBtn" disabled>💾 ファイルに保存</button>
-  <button id="loadFileBtn">📂 ファイルから読み込む</button>
+  <button id="saveManagerBtn">💾 保存管理</button>
+  <button id="loadFileBtn">📂 ファイルから読み込む（他端末用）</button>
   <input type="file" id="loadFileInput" accept=".json" style="display:none">
 </div>
 
 <div id="placingBanner">画像を選びました。地図上の配置したい場所をクリックしてください。（キャンセルする場合はEscキー）</div>
+
+<div id="saveManagerPanel">
+  <b>現在の状態を保存</b>
+  <div class="row">
+    <input type="text" id="saveNameInput" placeholder="保存名（例：1日目分・完成版など）">
+    <button id="doSaveBtn">この内容を保存</button>
+  </div>
+  <hr>
+  <b>保存済み一覧</b>
+  <div id="savedListEmpty">保存済みのデータはまだありません。</div>
+  <div id="savedList"></div>
+  <div class="row">
+    <button id="closeSaveManagerBtn">閉じる</button>
+  </div>
+</div>
 
 <div id="gridControls">
   <b>マス目検出モード：</b> 地図上でブロック1つ分くらいの範囲をドラッグして囲むと、その中を自動でマス目に分割します。
@@ -465,7 +521,13 @@ function loadImageAspect(dataUrl) {
 
 // ---------- マス目（自動検出セル）関連 ----------
 const gridModeBtn = document.getElementById("gridModeBtn");
-const saveFileBtn = document.getElementById("saveFileBtn");
+const saveManagerBtn = document.getElementById("saveManagerBtn");
+const saveManagerPanel = document.getElementById("saveManagerPanel");
+const saveNameInput = document.getElementById("saveNameInput");
+const doSaveBtn = document.getElementById("doSaveBtn");
+const savedList = document.getElementById("savedList");
+const savedListEmpty = document.getElementById("savedListEmpty");
+const closeSaveManagerBtn = document.getElementById("closeSaveManagerBtn");
 const loadFileBtn = document.getElementById("loadFileBtn");
 const loadFileInput = document.getElementById("loadFileInput");
 const gridControls = document.getElementById("gridControls");
@@ -511,7 +573,6 @@ fileInput.addEventListener("change", async (e) => {
     zoomOutBtn.disabled = false;
     addImageBtn.disabled = false;
     gridModeBtn.disabled = false;
-    saveFileBtn.disabled = false;
     await renderPage(currentPage);
     statusEl.textContent = `読み込み成功：全 ${pdfDoc.numPages} ページ`;
   } catch (err) {
@@ -1349,7 +1410,6 @@ async function restoreProjectState(data) {
   zoomOutBtn.disabled = false;
   addImageBtn.disabled = false;
   gridModeBtn.disabled = false;
-  saveFileBtn.disabled = false;
 
   await renderPage(currentPage);
   statusEl.textContent = `復元しました：全 ${pdfDoc.numPages} ページ／画像 ${pins.length} 件`;
@@ -1373,40 +1433,134 @@ async function restoreProjectState(data) {
 })();
 
 // --- ファイルへの書き出し ---
-saveFileBtn.addEventListener("click", () => {
+// --- 保存管理パネルの開閉 ---
+saveManagerBtn.addEventListener("click", async () => {
+  saveManagerPanel.classList.add("active");
+  await renderSavedList();
+});
+closeSaveManagerBtn.addEventListener("click", () => {
+  saveManagerPanel.classList.remove("active");
+});
+
+// --- 名前を付けて保存（アプリ内・IndexedDB）---
+doSaveBtn.addEventListener("click", async () => {
   if (!pdfArrayBuffer) {
     alert("先にPDFを読み込んでから保存してください。");
     return;
   }
+  const name = saveNameInput.value.trim() || `保存 ${new Date().toLocaleString("ja-JP")}`;
+  const key = `manual_${Date.now()}`;
+  const data = {
+    name,
+    pdfData: pdfArrayBuffer,
+    pdfFileName: pdfFileName,
+    pins, cells, currentPage, currentScale,
+    savedAt: Date.now()
+  };
   try {
-    const data = {
-      format: "comiket-map-tool-v1",
-      pdfFileName: pdfFileName,
-      pdfBase64: arrayBufferToBase64(pdfArrayBuffer),
-      pins, cells, currentPage, currentScale,
-      savedAt: Date.now()
-    };
-    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const dateStr = new Date().toISOString().slice(0, 10);
-
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `comiket-map-${dateStr}.json`;
-    a.style.display = "none";
-    document.body.appendChild(a); // 一部のブラウザはDOMに存在しないとダウンロードが始まらないため
-    a.click();
-    document.body.removeChild(a);
-
-    // クリック直後に取り消すとダウンロードが始まる前にURLが無効化されることがあるため、少し待ってから解放する
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-
-    statusEl.textContent = "ファイルに保存しました（ダウンロードフォルダをご確認ください）。";
+    const db = await openDB();
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(data, key);
+    await new Promise((res, rej) => {
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+    });
+    saveNameInput.value = "";
+    statusEl.textContent = `「${name}」として保存しました。`;
+    await renderSavedList();
   } catch (err) {
     console.error(err);
     alert("保存に失敗しました：" + err.message);
   }
 });
+
+// --- 保存済み一覧の取得・表示 ---
+async function getAllSavedEntries() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, "readonly");
+  const store = tx.objectStore(STORE_NAME);
+  const keys = await new Promise((res, rej) => {
+    const req = store.getAllKeys();
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+  const values = await new Promise((res, rej) => {
+    const req = store.getAll();
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+  return keys.map((key, i) => ({ key, data: values[i] }))
+    .filter(entry => entry.key !== "current") // 自動保存分は一覧に出さない
+    .sort((a, b) => (b.data.savedAt || 0) - (a.data.savedAt || 0));
+}
+
+async function renderSavedList() {
+  savedList.innerHTML = "";
+  let entries = [];
+  try {
+    entries = await getAllSavedEntries();
+  } catch (err) {
+    console.error(err);
+  }
+
+  if (entries.length === 0) {
+    savedListEmpty.style.display = "block";
+    return;
+  }
+  savedListEmpty.style.display = "none";
+
+  entries.forEach(({ key, data }) => {
+    const row = document.createElement("div");
+    row.className = "savedRow";
+
+    const info = document.createElement("div");
+    info.className = "savedInfo";
+    const nameEl = document.createElement("div");
+    nameEl.className = "savedName";
+    nameEl.textContent = data.name || "（名前なし）";
+    const metaEl = document.createElement("div");
+    metaEl.className = "savedMeta";
+    const dateStr = data.savedAt ? new Date(data.savedAt).toLocaleString("ja-JP") : "";
+    metaEl.textContent = `${dateStr} ／ 画像 ${(data.pins || []).length}件`;
+    info.appendChild(nameEl);
+    info.appendChild(metaEl);
+    row.appendChild(info);
+
+    const loadBtn = document.createElement("button");
+    loadBtn.textContent = "読み込む";
+    loadBtn.addEventListener("click", async () => {
+      try {
+        await restoreProjectState(data);
+        saveManagerPanel.classList.remove("active");
+      } catch (err) {
+        alert("読み込みに失敗しました：" + err.message);
+      }
+    });
+    row.appendChild(loadBtn);
+
+    const delBtn3 = document.createElement("button");
+    delBtn3.className = "savedDelBtn";
+    delBtn3.textContent = "削除";
+    delBtn3.addEventListener("click", async () => {
+      if (!confirm(`「${data.name || "この保存データ"}」を削除します。よろしいですか？`)) return;
+      try {
+        const db = await openDB();
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        tx.objectStore(STORE_NAME).delete(key);
+        await new Promise((res, rej) => {
+          tx.oncomplete = res;
+          tx.onerror = () => rej(tx.error);
+        });
+        await renderSavedList();
+      } catch (err) {
+        alert("削除に失敗しました：" + err.message);
+      }
+    });
+    row.appendChild(delBtn3);
+
+    savedList.appendChild(row);
+  });
+}
 
 // --- ファイルからの読み込み ---
 loadFileBtn.addEventListener("click", () => loadFileInput.click());
