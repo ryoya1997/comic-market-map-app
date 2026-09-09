@@ -32,18 +32,6 @@
   }
 
   /* スマホなど画面が狭い場合は1カラムに切り替える */
-  @media (max-width: 900px) {
-    body { padding: 10px; }
-    #layoutRow { flex-direction: column; }
-    #sideColumn {
-      width: 100%;
-      position: static;
-    }
-    #imageListPanel { max-height: 60vh; }
-    #toolbar { gap: 6px; }
-    #toolbar button, #toolbar input[type=file] { font-size: 13px; padding: 6px 8px; }
-    #viewerWrap { max-height: 65vh; }
-  }
   #toolbar {
     display: flex;
     align-items: center;
@@ -382,6 +370,33 @@
     text-decoration: none;
   }
   .memoLink:hover { text-decoration: underline; }
+/* ==== レスポンシブ対応：スマホなど画面が狭い場合はここで上書きする ==== */
+/* 他の通常のルールより後に置くことで、確実に優先させている */
+@media (max-width: 900px) {
+  body { padding: 8px; }
+  h1 { font-size: 16px; }
+  #layoutRow { flex-direction: column; gap: 12px; }
+  #sideColumn {
+    width: 100%;
+    position: static;
+  }
+  #imageListPanel { max-height: 50vh; }
+  #toolbar { gap: 6px; padding: 8px 10px; }
+  #toolbar button, #toolbar input[type=file] { font-size: 12px; padding: 6px 8px; }
+  #status, #pinCount { font-size: 12px; }
+}
+
+/* 縦向き（スマホを立てて持っている状態）：地図に高さを多めに割り当てる */
+@media (max-width: 900px) and (orientation: portrait) {
+  #viewerWrap { max-height: 52vh; }
+  #imageListPanel { max-height: 38vh; }
+}
+
+/* 横向き（スマホを横に持っている状態）：地図の高さをさらに広く取れる */
+@media (max-width: 900px) and (orientation: landscape) {
+  #viewerWrap { max-height: 78vh; }
+  #imageListPanel { max-height: 45vh; }
+}
 </style>
 </head>
 <body>
@@ -519,32 +534,9 @@ let selectedPinId = null;    // 現在選択中（ツールバー表示中）の
 
 let pdfDoc = null;
 let currentPage = 1;
-let currentScale = 1.5;
+let currentScale = 1.5; // PDFの表示倍率。これを100%として扱う（常にこの値がデフォルト）
 let pdfArrayBuffer = null; // 保存・復元のために元のPDFバイナリを保持しておく
 let pdfFileName = "";
-
-// 端末の画面幅（アスペクト比）にぴったり収まる表示倍率を計算する
-async function computeFitScale() {
-  if (!pdfDoc) return currentScale;
-  const page = await pdfDoc.getPage(1);
-  const nativeViewport = page.getViewport({ scale: 1 });
-  const wrapEl = document.getElementById("viewerWrap");
-  const available = Math.max(240, wrapEl.clientWidth - 32); // 32はpadding分の余白
-  let scale = available / nativeViewport.width;
-  scale = Math.max(0.35, Math.min(scale, 3)); // 極端に小さく/大きくなりすぎないようにする
-  return scale;
-}
-
-// 画面回転やウィンドウサイズ変更があったら、表示倍率を自動で再計算する
-let resizeFitTimer = null;
-window.addEventListener("resize", () => {
-  if (!pdfDoc) return;
-  clearTimeout(resizeFitTimer);
-  resizeFitTimer = setTimeout(async () => {
-    currentScale = await computeFitScale();
-    renderPage(currentPage);
-  }, 300);
-});
 
 // ピンのデータ本体。将来「保存・読み込み」機能を作るときは、この配列を
 // そのままJSONにして書き出す/読み込む形にすれば良い。
@@ -622,7 +614,7 @@ fileInput.addEventListener("change", async (e) => {
     zoomOutBtn.disabled = false;
     addImageBtn.disabled = false;
     gridModeBtn.disabled = false;
-    currentScale = await computeFitScale(); // 端末の画面幅にぴったり収まる倍率にする
+    currentScale = 1.5; // 常に100%（デフォルト倍率）で開始する
     await renderPage(currentPage);
     statusEl.textContent = `読み込み成功：全 ${pdfDoc.numPages} ページ`;
   } catch (err) {
@@ -1452,7 +1444,7 @@ async function restoreProjectState(data) {
   pins = data.pins || [];
   cells = data.cells || [];
   currentPage = Math.min(data.currentPage || 1, pdfDoc.numPages);
-  currentScale = await computeFitScale(); // 保存時の倍率ではなく、今開いている端末の画面幅に合わせる
+  currentScale = 1.5; // 保存時の倍率に関わらず、常に100%（デフォルト倍率）で開く
 
   prevBtn.disabled = false;
   nextBtn.disabled = false;
