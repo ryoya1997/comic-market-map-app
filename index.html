@@ -258,6 +258,21 @@
   .savedRow .savedMeta { font-size: 12px; color: #777; }
   .savedRow button { flex-shrink: 0; }
   .savedRow .savedDelBtn { color: #e63946; border-color: #e6a4a9; }
+  #shareCodeResult {
+    display: none;
+    background: #eef7f0;
+    border: 1px solid #a8d5b5;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 8px 0;
+    font-size: 14px;
+  }
+  #shareCodeResult .codeText {
+    font-size: 22px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    color: #1a7a3c;
+  }
 
   #gridControls {
     display: none;
@@ -404,6 +419,16 @@
   <b>保存済み一覧</b>
   <div id="savedListEmpty">保存済みのデータはまだありません。</div>
   <div id="savedList"></div>
+  <hr>
+  <b>他の端末と共有する</b>
+  <div class="row">
+    <button id="uploadCloudBtn">☁️ 共有コードを発行して保存</button>
+  </div>
+  <div id="shareCodeResult"></div>
+  <div class="row">
+    <input type="text" id="shareCodeInput" placeholder="共有コードを入力（例：AB12CD）" maxlength="6" style="text-transform:uppercase;">
+    <button id="downloadCloudBtn">このコードで読み込む</button>
+  </div>
   <div class="row">
     <button id="closeSaveManagerBtn">閉じる</button>
   </div>
@@ -459,6 +484,7 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
 // pdf.js本体の読み込みに失敗していないかを最初に確認する
 if (typeof pdfjsLib === "undefined") {
@@ -1414,6 +1440,100 @@ async function restoreProjectState(data) {
   await renderPage(currentPage);
   statusEl.textContent = `復元しました：全 ${pdfDoc.numPages} ページ／画像 ${pins.length} 件`;
 }
+
+// ---------- クラウド共有（Supabase・共有コード方式）----------
+const SUPABASE_URL = "https://wygphwsfknzauiurzmyi.supabase.co";
+const SUPABASE_KEY = "sb_publishable_hwKEBUhwEAgZHbRHiuyWfA_VmAv0OJZ";
+const SUPABASE_BUCKET = "comiket-map-saves";
+const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const uploadCloudBtn = document.getElementById("uploadCloudBtn");
+const shareCodeResult = document.getElementById("shareCodeResult");
+const shareCodeInput = document.getElementById("shareCodeInput");
+const downloadCloudBtn = document.getElementById("downloadCloudBtn");
+
+// 紛らわしい文字(0,O,1,I)を除いた6文字のコードを作る
+function generateShareCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+uploadCloudBtn.addEventListener("click", async () => {
+  if (!pdfArrayBuffer) {
+    alert("先にPDFを読み込んでから共有してください。");
+    return;
+  }
+  uploadCloudBtn.disabled = true;
+  uploadCloudBtn.textContent = "アップロード中...";
+  try {
+    const code = generateShareCode();
+    const data = {
+      name: saveNameInput.value.trim() || `共有 ${new Date().toLocaleString("ja-JP")}`,
+      pdfFileName,
+      pdfBase64: arrayBufferToBase64(pdfArrayBuffer),
+      pins, cells, currentPage, currentScale,
+      savedAt: Date.now()
+    };
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const { error } = await supabaseClient
+      .storage
+      .from(SUPABASE_BUCKET)
+      .upload(`save_${code}.json`, blob, { upsert: true, contentType: "application/json" });
+
+    if (error) throw error;
+
+    shareCodeResult.style.display = "block";
+    shareCodeResult.innerHTML =
+      `共有コード：<span class="codeText">${code}</span><br>このコードを別の端末で入力すると読み込めます。`;
+  } catch (err) {
+    console.error(err);
+    alert("アップロードに失敗しました：" + err.message);
+  } finally {
+    uploadCloudBtn.disabled = false;
+    uploadCloudBtn.textContent = "☁️ 共有コードを発行して保存";
+  }
+});
+
+downloadCloudBtn.addEventListener("click", async () => {
+  const code = shareCodeInput.value.trim().toUpperCase();
+  if (!code) {
+    alert("共有コードを入力してください。");
+    return;
+  }
+  downloadCloudBtn.disabled = true;
+  downloadCloudBtn.textContent = "読み込み中...";
+  try {
+    const { data, error } = await supabaseClient
+      .storage
+      .from(SUPABASE_BUCKET)
+      .download(`save_${code}.json`);
+
+    if (error) throw error;
+
+    const text = await data.text();
+    const parsed = JSON.parse(text);
+    const buffer = base64ToArrayBuffer(parsed.pdfBase64);
+
+    await restoreProjectState({
+      pdfData: buffer,
+      pdfFileName: parsed.pdfFileName,
+      pins: parsed.pins,
+      cells: parsed.cells,
+      currentPage: parsed.currentPage,
+      currentScale: parsed.currentScale
+    });
+    scheduleAutoSave();
+    saveManagerPanel.classList.remove("active");
+  } catch (err) {
+    console.error(err);
+    alert("読み込みに失敗しました。コードが正しいか確認してください。");
+  } finally {
+    downloadCloudBtn.disabled = false;
+    downloadCloudBtn.textContent = "このコードで読み込む";
+  }
+});
 
 // ページ起動時に、自動保存されたデータがないか確認する
 (async function checkAutoSavedData() {
