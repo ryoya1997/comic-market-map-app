@@ -523,6 +523,29 @@ let currentScale = 1.5;
 let pdfArrayBuffer = null; // 保存・復元のために元のPDFバイナリを保持しておく
 let pdfFileName = "";
 
+// 端末の画面幅（アスペクト比）にぴったり収まる表示倍率を計算する
+async function computeFitScale() {
+  if (!pdfDoc) return currentScale;
+  const page = await pdfDoc.getPage(1);
+  const nativeViewport = page.getViewport({ scale: 1 });
+  const wrapEl = document.getElementById("viewerWrap");
+  const available = Math.max(240, wrapEl.clientWidth - 32); // 32はpadding分の余白
+  let scale = available / nativeViewport.width;
+  scale = Math.max(0.35, Math.min(scale, 3)); // 極端に小さく/大きくなりすぎないようにする
+  return scale;
+}
+
+// 画面回転やウィンドウサイズ変更があったら、表示倍率を自動で再計算する
+let resizeFitTimer = null;
+window.addEventListener("resize", () => {
+  if (!pdfDoc) return;
+  clearTimeout(resizeFitTimer);
+  resizeFitTimer = setTimeout(async () => {
+    currentScale = await computeFitScale();
+    renderPage(currentPage);
+  }, 300);
+});
+
 // ピンのデータ本体。将来「保存・読み込み」機能を作るときは、この配列を
 // そのままJSONにして書き出す/読み込む形にすれば良い。
 // 1件ごとに { id, page, xPercent, yPercent, imageData, circleName, spaceNo, memo } を持つ
@@ -599,6 +622,7 @@ fileInput.addEventListener("change", async (e) => {
     zoomOutBtn.disabled = false;
     addImageBtn.disabled = false;
     gridModeBtn.disabled = false;
+    currentScale = await computeFitScale(); // 端末の画面幅にぴったり収まる倍率にする
     await renderPage(currentPage);
     statusEl.textContent = `読み込み成功：全 ${pdfDoc.numPages} ページ`;
   } catch (err) {
@@ -1428,7 +1452,7 @@ async function restoreProjectState(data) {
   pins = data.pins || [];
   cells = data.cells || [];
   currentPage = Math.min(data.currentPage || 1, pdfDoc.numPages);
-  currentScale = data.currentScale || 1.5;
+  currentScale = await computeFitScale(); // 保存時の倍率ではなく、今開いている端末の画面幅に合わせる
 
   prevBtn.disabled = false;
   nextBtn.disabled = false;
